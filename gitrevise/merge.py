@@ -13,10 +13,11 @@ unmodified trees and blobs when possible.
 from typing import Optional, Tuple, TypeVar
 from pathlib import Path
 from subprocess import CalledProcessError
+import hashlib
+import os
 
-from .odb import Tree, Blob, Commit, Entry, Mode
+from .odb import Tree, Blob, Commit, Entry, Mode, Repository
 from .utils import edit_file
-
 
 T = TypeVar("T")  # pylint: disable=C0103
 
@@ -199,6 +200,13 @@ def merge_blobs(
         if err.returncode < 0:
             raise
 
+        preimage = err.output
+        recorded_postimage, conflict_id = reuse_recorded_resolution(
+            repo, preimage
+        )
+        if recorded_postimage:
+            return recorded_postimage
+
         # At this point, we know that there are merge conflicts to resolve.
         # Prompt to try and trigger manual resolution.
         print(f"Conflict applying '{labels[2]}'")
@@ -210,11 +218,11 @@ def merge_blobs(
         # matches the path of the original file for a better editor experience.
         conflicts = tmpdir / "conflict" / path.relative_to("/")
         conflicts.parent.mkdir(parents=True, exist_ok=True)
-        conflicts.write_bytes(err.output)
+        conflicts.write_bytes(preimage)
         merged = edit_file(repo, conflicts)
 
         # Print warnings if the merge looks like it may have failed.
-        if merged == err.output:
+        if merged == preimage:
             print("(note) conflicted file is unchanged")
 
         if b"<<<<<<<" in merged or b"=======" in merged or b">>>>>>>" in merged:
@@ -224,4 +232,101 @@ def merge_blobs(
         if input("  Merge successful? (y/N) ").lower() != "y":
             raise MergeConflict("user aborted")  # pylint: disable=W0707
 
+        record_resolution(repo, conflict_id, preimage, merged)
+
     return Blob(current.repo, merged)
+
+
+def reuse_recorded_resolution(
+    repo, preimage
+) -> Tuple[Optional[Blob], Optional[str]]:
+    rr_cache = repo.gitdir / "rr-cache"
+    # TODO Should we cache settings like this?
+    if not repo.bool_config("rerere.enabled", default=rr_cache.is_dir()):
+        return None, None
+
+    conflict_id = conflict_id_by_file_contents(preimage)
+    conflict_dir = rr_cache / conflict_id
+    if not conflict_dir.is_dir():
+        return None, conflict_id
+    if not repo.bool_config("rerere.autoUpdate", default=False):
+        return None, conflict_id
+    postimage_path = conflict_dir / "postimage"
+    postimage = postimage_path.read_bytes()
+    recorded_preimage = (conflict_dir / "preimage").read_bytes()
+    try:
+        result = merge_blobs(
+            repo.workdir,  # TODO is this correct?
+            labels=(
+                "current",
+                "base",
+                "other",
+            ),
+            current=Blob(repo, postimage),
+            base=Blob(repo, recorded_preimage),
+            other=Blob(repo, preimage),
+        )
+    except: # TODO
+        # We could ask the user to merge this. However, that could be confusing.
+        # Just fall back to letting them resolve the entire conflict.
+        return None, None
+    print("Successfully replayed recorded resolution")
+    # Mark that "postimage" was used to help git gc.
+    os.utime(postimage_path)
+    return result, conflict_id
+
+
+def record_resolution(
+    repo: Repository, conflict_id: Optional[str], preimage: bytes, postimage: bytes
+) -> None:
+    if conflict_id is None:
+        return
+
+    conflict_dir = repo.gitdir / "rr-cache" / conflict_id
+    conflict_dir.parent.mkdir(exist_ok=True)
+    conflict_dir.mkdir(exist_ok=True)
+    print("Recording conflict resolution")
+    (conflict_dir / "preimage").write_bytes(preimage)
+    (conflict_dir / "postimage").write_bytes(postimage)
+
+
+RR_OTHER = 0
+RR_SIDE_1 = 1
+RR_SIDE_2 = 2
+
+MARKER_SIZE = 7
+
+
+def conflict_id_by_file_contents(preimage: bytes) -> str:
+    hunk = RR_OTHER
+    one = b""
+    two = b""
+    context = hashlib.sha1()
+    for line in preimage.splitlines():
+        if line.startswith(b"<" * MARKER_SIZE):
+            hunk = RR_SIDE_1
+            continue
+        if line.startswith(b"|" * MARKER_SIZE):
+            if hunk != RR_SIDE_1:
+                break
+            hunk = RR_OTHER
+            continue
+        if line.startswith(b"=" * MARKER_SIZE):
+            hunk = RR_SIDE_2
+            continue
+        if line.startswith(b">" * MARKER_SIZE):
+            if one > two:
+                one, two = two, one
+            context.update(one + b"\0" + two + b"\0")
+            one = b""
+            two = b""
+        if hunk == RR_SIDE_1:
+            one += line + b"\n"
+            continue
+        if hunk == RR_OTHER:
+            continue
+        if hunk == RR_SIDE_2:
+            two += line + b"\n"
+            continue
+        assert False
+    return context.hexdigest()
