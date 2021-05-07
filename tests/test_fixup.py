@@ -375,3 +375,90 @@ def test_autosquash_multiline_summary(repo):
     new = repo.get_commit("HEAD")
     assert old != new, "commit was modified"
     assert old.parents() == new.parents(), "parents are unchanged"
+
+
+def test_autosquash_multiple_squashes(repo):
+    bash(
+        """
+        git commit --allow-empty -m 'initial commit'
+        git commit --allow-empty -m 'target'
+        git commit --allow-empty --squash :/^target --no-edit
+        git commit --allow-empty --squash :/^target --no-edit
+        """
+    )
+
+    with editor_main([":/^init", "--autosquash"], input=b"") as ed:
+        with ed.next_file() as f:
+            assert f.startswith_dedent(
+                """\
+                # This is a combination of 3 commits.
+                # This is the 1st commit message:
+
+                target
+
+                # This is the commit message #2:
+
+                squash! target
+
+                # This is the commit message #3:
+
+                squash! target
+                """
+            )
+            f.replace_dedent("two squashes")
+
+
+def test_autosquash_multiple_squashes_with_fixup(repo):
+    bash(
+        """
+        git commit --allow-empty -m 'initial commit'
+        git commit --allow-empty -m 'target'
+        git commit --allow-empty --squash :/^target --no-edit
+        git commit --allow-empty --fixup :/^target --no-edit
+        git commit --allow-empty --squash :/^target --no-edit
+        git commit --allow-empty -m 'unrelated'
+        """
+    )
+    with editor_main([":/^init", "--autosquash"], input=b"") as ed:
+        with ed.next_file() as f:
+            assert f.startswith_dedent(
+                """\
+                # This is a combination of 4 commits.
+                # This is the 1st commit message:
+
+                target
+
+                # This is the commit message #2:
+
+                squash! target
+
+                # The commit message #3 will be skipped:
+
+                # fixup! target
+
+                # This is the commit message #4:
+
+                squash! target
+                """
+            )
+            f.replace_dedent("squashes + fixup")
+
+
+def test_autosquash_multiple_independent_squashes(repo):
+    bash(
+        """
+        git commit --allow-empty -m 'initial commit'
+        git commit --allow-empty -m 'target1'
+        git commit --allow-empty -m 'target2'
+        git commit --allow-empty --squash :/^target1 --no-edit
+        git commit --allow-empty --squash :/^target2 --no-edit
+        """
+    )
+
+    with editor_main([":/^init", "--autosquash"], input=b"") as ed:
+        with ed.next_file() as f:
+            assert f.startswith_dedent("# This is a combination of 2 commits.")
+            f.replace_dedent("squash 1")
+        with ed.next_file() as f:
+            assert f.startswith_dedent("# This is a combination of 2 commits.")
+            f.replace_dedent("squash 2")
